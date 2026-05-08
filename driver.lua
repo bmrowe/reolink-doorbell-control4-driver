@@ -32,6 +32,7 @@ do
     RECONNECT_DELAY_MS = 10000
     HTTP_WATCHDOG_MS = 15000
     BAICHUAN_PENDING_MAX_AGE_MS = 60000
+    BAICHUAN_MAX_FRAME_BYTES = 262144
 end
 
 local function now_ms()
@@ -197,6 +198,9 @@ local function cancel_baichuan_keepalive()
     end
 end
 
+local clear_http_watchdog
+local start_poll_timer
+
 local function reset_http_session()
     RUNTIME.token = nil
     RUNTIME.token_expiry_ms = 0
@@ -239,7 +243,7 @@ local function start_http_watchdog(timer_name, flag_name, label)
     end, false)
 end
 
-local function clear_http_watchdog(timer_name)
+clear_http_watchdog = function(timer_name)
     cancel_timer(timer_name)
 end
 
@@ -267,8 +271,7 @@ local set_refresh_result
 
 local function c4_md5_modern(value)
     local hash = C4:Hash("md5", value, { ["return_encoding"] = "HEX" })
-    hash = string.upper(tostring(hash or ""))
-    return string.sub(hash, 1, 31)
+    return string.upper(tostring(hash or ""))
 end
 
 local function baichuan_encrypt(buf, offset)
@@ -530,6 +533,10 @@ local function baichuan_process_chunk(chunk)
 
     local cmd_id = little_endian_u32(data, 5)
     local rec_len_body = little_endian_u32(data, 9)
+    if rec_len_body > BAICHUAN_MAX_FRAME_BYTES then
+        return nil, "frame_too_large"
+    end
+
     local full_mess_id = little_endian_u32(data, 13)
     local message_class = string.sub(data, 19, 20)
     local len_header
@@ -554,11 +561,15 @@ local function baichuan_process_chunk(chunk)
         return nil, "need_more"
     end
 
+    local len_chunk = rec_len_body + len_header
+    if len_chunk > BAICHUAN_MAX_FRAME_BYTES then
+        return nil, "frame_too_large"
+    end
+
     if payload_offset == 0 then
         payload_offset = rec_len_body
     end
 
-    local len_chunk = rec_len_body + len_header
     local len_message = payload_offset + len_header
     local data_chunk = string.sub(data, 1, len_message)
     local payload = string.sub(data, len_message + 1, len_chunk)
@@ -583,6 +594,11 @@ end
 
 local function baichuan_handle_data(strData)
     RUNTIME.baichuan.buffer = (RUNTIME.baichuan.buffer or "") .. (strData or "")
+    if #RUNTIME.baichuan.buffer > BAICHUAN_MAX_FRAME_BYTES then
+        warn("Baichuan receive buffer exceeded limit; clearing buffered data")
+        RUNTIME.baichuan.buffer = ""
+        return
+    end
 
     while RUNTIME.baichuan.buffer and #RUNTIME.baichuan.buffer > 0 do
         local buffer = RUNTIME.baichuan.buffer
@@ -842,7 +858,7 @@ local function perform_getevents(reason)
     end)
 end
 
-local function start_poll_timer()
+start_poll_timer = function()
     cancel_timer("poll_timer")
     local interval_seconds = tonumber(RUNTIME.config.poll_fallback_seconds) or 5
     local interval_ms = math.max(interval_seconds, 1) * 1000
