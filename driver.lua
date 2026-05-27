@@ -147,13 +147,17 @@ local function ensure_runtime_defaults()
     RUNTIME.token_expiry_ms = RUNTIME.token_expiry_ms or 0
     RUNTIME.login_in_flight = RUNTIME.login_in_flight or false
     RUNTIME.refresh_in_flight = RUNTIME.refresh_in_flight or false
+    RUNTIME.push_refresh_in_flight = RUNTIME.push_refresh_in_flight or false
     RUNTIME.pending_refresh_reason = RUNTIME.pending_refresh_reason or nil
+    RUNTIME.pending_push_refresh_reason = RUNTIME.pending_push_refresh_reason or nil
     RUNTIME.refresh_burst_active = RUNTIME.refresh_burst_active or false
     RUNTIME.initializing_properties = RUNTIME.initializing_properties or false
     RUNTIME.shutting_down = RUNTIME.shutting_down or false
     RUNTIME.reconnect_timer = RUNTIME.reconnect_timer or nil
     RUNTIME.login_watchdog_timer = RUNTIME.login_watchdog_timer or nil
     RUNTIME.refresh_watchdog_timer = RUNTIME.refresh_watchdog_timer or nil
+    RUNTIME.push_refresh_watchdog_timer = RUNTIME.push_refresh_watchdog_timer or nil
+    RUNTIME.token_renewal_timer = RUNTIME.token_renewal_timer or nil
     RUNTIME.baichuan = RUNTIME.baichuan or {}
     RUNTIME.baichuan.buffer = RUNTIME.baichuan.buffer or ""
     RUNTIME.baichuan.pending = RUNTIME.baichuan.pending or {}
@@ -200,15 +204,20 @@ end
 
 local clear_http_watchdog
 local start_poll_timer
+local perform_login
 
 local function reset_http_session()
     RUNTIME.token = nil
     RUNTIME.token_expiry_ms = 0
     RUNTIME.login_in_flight = false
     RUNTIME.refresh_in_flight = false
+    RUNTIME.push_refresh_in_flight = false
     RUNTIME.pending_refresh_reason = nil
+    RUNTIME.pending_push_refresh_reason = nil
+    cancel_timer("token_renewal_timer")
     clear_http_watchdog("login_watchdog_timer")
     clear_http_watchdog("refresh_watchdog_timer")
+    clear_http_watchdog("push_refresh_watchdog_timer")
 end
 
 local function restart_poll_timer_if_running()
@@ -254,6 +263,41 @@ end
 
 local function token_is_valid()
     return RUNTIME.token ~= nil and (tonumber(RUNTIME.token_expiry_ms) or 0) > (now_ms() + 60000)
+end
+
+local function is_push_refresh(reason)
+    return string.match(tostring(reason or ""), "^baichuan_push_") ~= nil
+end
+
+local function update_connection_status_display(status)
+    update_property(PROPERTY_CONNECTION_STATUS, status)
+    set_variable(VARIABLE_CONNECTION_STATUS, status)
+end
+
+local function schedule_token_renewal(lease_time)
+    cancel_timer("token_renewal_timer")
+
+    local lease_seconds = tonumber(lease_time) or 0
+    if lease_seconds <= 0 then
+        return
+    end
+
+    local renew_ms
+    if lease_seconds > 120 then
+        renew_ms = (lease_seconds - 60) * 1000
+    else
+        renew_ms = math.max(math.floor(lease_seconds * 500), 10000)
+    end
+
+    RUNTIME.token_renewal_timer = C4:SetTimer(renew_ms, function()
+        RUNTIME.token_renewal_timer = nil
+        if RUNTIME.shutting_down or not has_minimum_config() then
+            return
+        end
+
+        dbg("Renewing Reolink API token before expiry")
+        perform_login()
+    end, false)
 end
 
 local function parse_json(raw)
@@ -404,9 +448,11 @@ end
 
 local function baichuan_subscribe()
     dbg("Subscribing to Baichuan events")
+    update_connection_status_display("TCP Connected - Subscribing")
     baichuan_send_command(31, { ch_id = 251, message_class = "1464" }, function(response)
         RUNTIME.baichuan.subscribed = true
         dbg("Baichuan subscribe acknowledged")
+        update_connection_status_display("Push Subscribed")
         stop_poll_timer()
         baichuan_start_keepalive()
         schedule_state_refresh("baichuan_subscribed")
@@ -437,6 +483,7 @@ local function baichuan_login()
         .. "</body>\n"
 
     dbg("Sending Baichuan modern login")
+    update_connection_status_display("TCP Connected - Logging In")
     baichuan_send_command(1, { ch_id = 250, body = xml, enc_type = "bc", message_class = "1464" }, function(response)
         RUNTIME.baichuan.logged_in = true
         RUNTIME.baichuan.login_state = "logged_in"
@@ -448,6 +495,7 @@ end
 local function baichuan_request_nonce()
     RUNTIME.baichuan.login_state = "nonce"
     dbg("Requesting Baichuan nonce")
+    update_connection_status_display("TCP Connected - Authenticating")
     baichuan_send_command(1, { ch_id = 250, message_class = "1465", enc_type = "bc" }, function(response)
         local nonce = baichuan_parse_xml_value(response.body, "nonce")
         if not nonce then
@@ -682,15 +730,13 @@ local function mark_connection_status(status)
     RUNTIME.connected = (status == "ONLINE")
 
     if RUNTIME.connected then
-        update_property(PROPERTY_CONNECTION_STATUS, "Connected")
-        set_variable(VARIABLE_CONNECTION_STATUS, "Connected")
+        update_connection_status_display("TCP Connected")
         if RUNTIME.connection_lost_fired then
             info("Connection restored")
             RUNTIME.connection_lost_fired = false
         end
     else
-        update_property(PROPERTY_CONNECTION_STATUS, "Disconnected")
-        set_variable(VARIABLE_CONNECTION_STATUS, "Disconnected")
+        update_connection_status_display("Disconnected")
         if was_connected and not RUNTIME.connection_lost_fired and not RUNTIME.shutting_down then
             warn("Connection lost")
             RUNTIME.connection_lost_fired = true
@@ -699,6 +745,13 @@ local function mark_connection_status(status)
 end
 
 local function handle_pending_refresh()
+    if RUNTIME.pending_push_refresh_reason then
+        local reason = RUNTIME.pending_push_refresh_reason
+        RUNTIME.pending_push_refresh_reason = nil
+        REOLINK.RefreshVisitorState(reason)
+        return
+    end
+
     if RUNTIME.pending_refresh_reason then
         local reason = RUNTIME.pending_refresh_reason
         RUNTIME.pending_refresh_reason = nil
@@ -748,14 +801,14 @@ local function evaluate_events_response(decoded, reason)
 
     dbg("GetEvents visitor support=" .. tostring(supported) .. " active=" .. tostring(active) .. " previous=" .. tostring(previous))
 
-    if active and previous ~= true then
+    if active and (previous ~= true or is_push_refresh(reason)) then
         fire_visitor_pressed(reason)
     elseif not active and previous == true then
         dbg("Visitor state reset to false from source " .. tostring(reason))
     end
 end
 
-local function perform_login()
+perform_login = function()
     if RUNTIME.login_in_flight then
         return
     end
@@ -806,6 +859,7 @@ local function perform_login()
 
         RUNTIME.token = tostring(token)
         RUNTIME.token_expiry_ms = now_ms() + (lease_time * 1000)
+        schedule_token_renewal(lease_time)
         set_refresh_result("Login OK at " .. now_string())
         dbg("Reolink login succeeded, leaseTime=" .. tostring(lease_time))
         handle_pending_refresh()
@@ -813,19 +867,34 @@ local function perform_login()
 end
 
 local function perform_getevents(reason)
-    if RUNTIME.refresh_in_flight then
-        RUNTIME.pending_refresh_reason = reason or "queued_refresh"
-        return
+    local push_refresh = is_push_refresh(reason)
+    if push_refresh then
+        if RUNTIME.push_refresh_in_flight then
+            RUNTIME.pending_push_refresh_reason = reason or "queued_push_refresh"
+            return
+        end
+        RUNTIME.push_refresh_in_flight = true
+        start_http_watchdog("push_refresh_watchdog_timer", "push_refresh_in_flight", "Push GetEvents")
+    else
+        if RUNTIME.refresh_in_flight then
+            RUNTIME.pending_refresh_reason = reason or "queued_refresh"
+            return
+        end
+        RUNTIME.refresh_in_flight = true
+        start_http_watchdog("refresh_watchdog_timer", "refresh_in_flight", "GetEvents")
     end
 
-    RUNTIME.refresh_in_flight = true
-    start_http_watchdog("refresh_watchdog_timer", "refresh_in_flight", "GetEvents")
     local url = base_url() .. "?cmd=GetEvents&token=" .. tostring(RUNTIME.token)
     local body = build_getevents_body(RUNTIME.config.channel)
 
     post_json(url, body, function(ticketId, responseData, responseCode, tHeaders)
-        RUNTIME.refresh_in_flight = false
-        clear_http_watchdog("refresh_watchdog_timer")
+        if push_refresh then
+            RUNTIME.push_refresh_in_flight = false
+            clear_http_watchdog("push_refresh_watchdog_timer")
+        else
+            RUNTIME.refresh_in_flight = false
+            clear_http_watchdog("refresh_watchdog_timer")
+        end
 
         if tonumber(responseCode) ~= 200 then
             set_refresh_result("GetEvents HTTP " .. tostring(responseCode))
@@ -960,7 +1029,11 @@ function REOLINK.RefreshVisitorState(reason)
     if token_is_valid() then
         perform_getevents(reason)
     else
-        RUNTIME.pending_refresh_reason = reason
+        if is_push_refresh(reason) then
+            RUNTIME.pending_push_refresh_reason = reason
+        else
+            RUNTIME.pending_refresh_reason = reason
+        end
         perform_login()
     end
 end
