@@ -7,7 +7,7 @@ REOLINK = REOLINK or {}
 BIT = bit32 or bit
 
 do
-    DEFAULT_NETBINDING = 6001
+    BAICHUAN_NETBINDING = 6002
     BAICHUAN_HEADER_MAGIC = "f0debc0a"
     BAICHUAN_XML_KEY = {0x1F, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0xFF}
 
@@ -30,6 +30,7 @@ do
     VARIABLE_CONNECTION_STATUS = "CONNECTION_STATUS"
     VARIABLE_LAST_PUSH_TIMESTAMP = "LAST_PUSH_TIMESTAMP"
     RECONNECT_DELAY_MS = 10000
+    BAICHUAN_KEEPALIVE_INTERVAL_MS = 30000
     HTTP_WATCHDOG_MS = 15000
     BAICHUAN_PENDING_MAX_AGE_MS = 60000
     BAICHUAN_MAX_FRAME_BYTES = 262144
@@ -142,6 +143,7 @@ local function ensure_runtime_defaults()
     RUNTIME.push_buffer = RUNTIME.push_buffer or ""
     RUNTIME.last_push_ms = RUNTIME.last_push_ms or 0
     RUNTIME.last_visitor_event_ms = RUNTIME.last_visitor_event_ms or 0
+    RUNTIME.visitor_event_latched = RUNTIME.visitor_event_latched or false
     RUNTIME.visitor_state = RUNTIME.visitor_state
     RUNTIME.token = RUNTIME.token or nil
     RUNTIME.token_expiry_ms = RUNTIME.token_expiry_ms or 0
@@ -151,6 +153,7 @@ local function ensure_runtime_defaults()
     RUNTIME.pending_refresh_reason = RUNTIME.pending_refresh_reason or nil
     RUNTIME.pending_push_refresh_reason = RUNTIME.pending_push_refresh_reason or nil
     RUNTIME.refresh_burst_active = RUNTIME.refresh_burst_active or false
+    RUNTIME.refresh_burst_cancelled = RUNTIME.refresh_burst_cancelled or false
     RUNTIME.initializing_properties = RUNTIME.initializing_properties or false
     RUNTIME.shutting_down = RUNTIME.shutting_down or false
     RUNTIME.reconnect_timer = RUNTIME.reconnect_timer or nil
@@ -165,8 +168,10 @@ local function ensure_runtime_defaults()
     RUNTIME.baichuan.logged_in = RUNTIME.baichuan.logged_in or false
     RUNTIME.baichuan.subscribed = RUNTIME.baichuan.subscribed or false
     RUNTIME.baichuan.nonce = RUNTIME.baichuan.nonce or nil
+    RUNTIME.baichuan.aes_key = RUNTIME.baichuan.aes_key or nil
     RUNTIME.baichuan.keepalive_timer = RUNTIME.baichuan.keepalive_timer or nil
     RUNTIME.baichuan.login_state = RUNTIME.baichuan.login_state or "idle"
+    RUNTIME.baichuan.events_active = RUNTIME.baichuan.events_active or false
     RUNTIME.state_refresh_timer = RUNTIME.state_refresh_timer or nil
     RUNTIME.poll_timer = RUNTIME.poll_timer or nil
 end
@@ -312,10 +317,11 @@ end
 
 local schedule_state_refresh
 local set_refresh_result
+local fire_visitor_pressed
 
 local function c4_md5_modern(value)
     local hash = C4:Hash("md5", value, { ["return_encoding"] = "HEX" })
-    return string.upper(tostring(hash or ""))
+    return string.sub(string.upper(tostring(hash or "")), 1, 31)
 end
 
 local function baichuan_encrypt(buf, offset)
@@ -331,6 +337,42 @@ end
 
 local function baichuan_decrypt(buf, offset)
     return baichuan_encrypt(buf, offset)
+end
+
+local function looks_like_xml(value)
+    return type(value) == "string" and (string.find(value, "<?xml", 1, true) ~= nil or string.find(value, "<body", 1, true) ~= nil)
+end
+
+local function baichuan_decrypt_aes(buf)
+    if not C4 or not C4.Decrypt or not RUNTIME.baichuan.aes_key or not buf or buf == "" then
+        return nil
+    end
+
+    local ciphers = { "AES-128-CFB", "AES-128-CFB128", "AES-128-CFB-128" }
+    for _, cipher in ipairs(ciphers) do
+        local ok, decrypted, err = pcall(function()
+            return C4:Decrypt(cipher, RUNTIME.baichuan.aes_key, "0123456789abcdef", buf, {
+                return_encoding = "NONE",
+                key_encoding = "NONE",
+                iv_encoding = "NONE",
+                data_encoding = "NONE",
+                padding = false,
+            })
+        end)
+
+        if ok and looks_like_xml(decrypted) then
+            RUNTIME.baichuan.aes_cipher = RUNTIME.baichuan.aes_cipher or cipher
+            return decrypted
+        end
+
+        if not ok then
+            dbg("Baichuan AES decrypt " .. cipher .. " raised " .. tostring(decrypted))
+        elseif err then
+            dbg("Baichuan AES decrypt " .. cipher .. " returned " .. tostring(err))
+        end
+    end
+
+    return nil
 end
 
 local function baichuan_full_mess_id(ch_id, mess_id)
@@ -395,6 +437,14 @@ local function baichuan_parse_xml_value(xml, key)
     return string.match(xml, pattern)
 end
 
+local function baichuan_body_has_visitor_event(body)
+    local status = baichuan_parse_xml_value(body or "", "status")
+    if status then
+        return string.find(string.lower(status), "visitor", 1, true) ~= nil, status
+    end
+    return nil, nil
+end
+
 local function baichuan_send_command(cmd_id, opts, callback)
     local built = baichuan_build_packet(cmd_id, opts)
     RUNTIME.baichuan.pending[cmd_id] = RUNTIME.baichuan.pending[cmd_id] or {}
@@ -414,7 +464,7 @@ local function baichuan_send_command(cmd_id, opts, callback)
             .. " bytes="
             .. tostring(#built.packet)
     )
-    C4:SendToNetwork(DEFAULT_NETBINDING, RUNTIME.config.baichuan_port, built.packet)
+    C4:SendToNetwork(BAICHUAN_NETBINDING, RUNTIME.config.baichuan_port, built.packet)
 end
 
 local function baichuan_gc_pending()
@@ -432,17 +482,32 @@ local function baichuan_gc_pending()
     end
 end
 
-local function baichuan_start_keepalive()
-    cancel_baichuan_keepalive()
-    RUNTIME.baichuan.keepalive_timer = C4:SetTimer(30000, function()
-        if not RUNTIME.connected or not RUNTIME.baichuan.subscribed then
-            return
-        end
-        baichuan_gc_pending()
+local function baichuan_send_keepalive()
+    if not RUNTIME.connected or not RUNTIME.baichuan.subscribed then
+        return
+    end
+
+    baichuan_gc_pending()
+    if RUNTIME.baichuan.events_active then
         dbg("Sending Baichuan keepalive")
         baichuan_send_command(93, { ch_id = 250, message_class = "1464" }, function(response)
             dbg("Baichuan keepalive acknowledged")
         end)
+    else
+        dbg("Refreshing Baichuan event subscription")
+        baichuan_send_command(31, { ch_id = 251, message_class = "1464" }, function(response)
+            dbg("Baichuan event subscription refresh acknowledged")
+        end)
+    end
+end
+
+local function baichuan_start_keepalive()
+    cancel_baichuan_keepalive()
+    RUNTIME.baichuan.keepalive_timer = C4:SetTimer(BAICHUAN_KEEPALIVE_INTERVAL_MS, function()
+        if not RUNTIME.connected or not RUNTIME.baichuan.subscribed then
+            return
+        end
+        baichuan_send_keepalive()
     end, true)
 end
 
@@ -455,7 +520,6 @@ local function baichuan_subscribe()
         update_connection_status_display("Push Subscribed")
         stop_poll_timer()
         baichuan_start_keepalive()
-        schedule_state_refresh("baichuan_subscribed")
     end)
 end
 
@@ -503,6 +567,7 @@ local function baichuan_request_nonce()
             return
         end
         RUNTIME.baichuan.nonce = nonce
+        RUNTIME.baichuan.aes_key = string.sub(c4_md5_modern(nonce .. "-" .. (RUNTIME.config.password or "")), 1, 16)
         dbg("Baichuan nonce received")
         baichuan_login()
     end)
@@ -514,8 +579,12 @@ local function baichuan_clear_session()
     RUNTIME.baichuan.logged_in = false
     RUNTIME.baichuan.subscribed = false
     RUNTIME.baichuan.nonce = nil
+    RUNTIME.baichuan.aes_key = nil
+    RUNTIME.baichuan.aes_cipher = nil
     RUNTIME.baichuan.login_state = "idle"
+    RUNTIME.baichuan.events_active = false
     RUNTIME.refresh_burst_active = false
+    RUNTIME.refresh_burst_cancelled = false
     cancel_baichuan_keepalive()
 end
 
@@ -534,8 +603,30 @@ local function baichuan_handle_unsolicited(cmd_id, full_mess_id, body, payload)
         dbg("Ignoring unsolicited cmd_id=" .. tostring(cmd_id) .. " for refresh triggering")
         return
     end
+    RUNTIME.baichuan.events_active = true
+
+    local has_visitor, status = baichuan_body_has_visitor_event(body)
+    if has_visitor == false then
+        if RUNTIME.visitor_state == true or RUNTIME.visitor_event_latched then
+            RUNTIME.visitor_state = false
+            RUNTIME.visitor_event_latched = false
+            dbg("Visitor state reset from Baichuan status=" .. tostring(status))
+        else
+            dbg("Ignoring Baichuan alarm event with non-visitor status=" .. tostring(status))
+        end
+        return
+    elseif has_visitor == true then
+        RUNTIME.visitor_state = true
+        set_refresh_result("visitor=true source=baichuan_direct")
+        fire_visitor_pressed("baichuan_direct")
+        return
+    elseif has_visitor == nil then
+        dbg("Baichuan alarm event status unavailable; confirming with GetEvents")
+    end
+
     if not RUNTIME.refresh_burst_active then
         RUNTIME.refresh_burst_active = true
+        RUNTIME.refresh_burst_cancelled = false
         cancel_timer("state_refresh_timer")
 
         local burst_reason = "baichuan_push_" .. tostring(cmd_id)
@@ -543,9 +634,16 @@ local function baichuan_handle_unsolicited(cmd_id, full_mess_id, body, payload)
         local burst_index = 1
 
         local function queue_next()
+            if RUNTIME.refresh_burst_cancelled then
+                RUNTIME.refresh_burst_active = false
+                RUNTIME.refresh_burst_cancelled = false
+                return
+            end
+
             local delay_ms = delays[burst_index]
             if delay_ms == nil then
                 RUNTIME.refresh_burst_active = false
+                RUNTIME.refresh_burst_cancelled = false
                 return
             end
 
@@ -562,6 +660,7 @@ local function baichuan_handle_unsolicited(cmd_id, full_mess_id, body, payload)
                 RUNTIME.state_refresh_timer = timer_or_err
             else
                 RUNTIME.refresh_burst_active = false
+                RUNTIME.refresh_burst_cancelled = false
                 warn("Failed to schedule refresh burst timer: " .. tostring(timer_or_err))
             end
         end
@@ -627,7 +726,7 @@ local function baichuan_process_chunk(chunk)
     local enc_body = string.sub(data_chunk, len_header + 1)
     local body = ""
     if #enc_body > 0 then
-        body = baichuan_decrypt(enc_body, ch_id)
+        body = baichuan_decrypt_aes(enc_body) or baichuan_decrypt(enc_body, ch_id)
     end
 
     return {
@@ -680,14 +779,18 @@ local function baichuan_handle_data(strData)
             if not next(cmd_pending) then
                 RUNTIME.baichuan.pending[parsed.cmd_id] = nil
             end
-            dbg(
-                "Baichuan response cmd_id="
-                    .. tostring(parsed.cmd_id)
-                    .. " mess_id="
-                    .. tostring(parsed.full_mess_id)
-                    .. " body_prefix="
-                    .. tostring(string.sub(parsed.body or "", 1, 48))
-            )
+            if parsed.cmd_id == 93 then
+                dbg("Baichuan keepalive response cmd_id=93 mess_id=" .. tostring(parsed.full_mess_id))
+            else
+                dbg(
+                    "Baichuan response cmd_id="
+                        .. tostring(parsed.cmd_id)
+                        .. " mess_id="
+                        .. tostring(parsed.full_mess_id)
+                        .. " body_prefix="
+                        .. tostring(string.sub(parsed.body or "", 1, 48))
+                )
+            end
             pending.callback(parsed)
         else
             baichuan_handle_unsolicited(parsed.cmd_id, parsed.full_mess_id, parsed.body or "", parsed.payload or "")
@@ -711,7 +814,12 @@ local function fire_event(name)
     C4:FireEvent(name)
 end
 
-local function fire_visitor_pressed(source)
+fire_visitor_pressed = function(source)
+    if RUNTIME.visitor_event_latched then
+        dbg("Ignoring visitor event while active visitor episode is latched from " .. tostring(source))
+        return
+    end
+
     local elapsed_ms = now_ms() - (RUNTIME.last_visitor_event_ms or 0)
     local debounce_ms = (tonumber(RUNTIME.config.debounce_seconds) or 3) * 1000
     if elapsed_ms < debounce_ms then
@@ -719,6 +827,7 @@ local function fire_visitor_pressed(source)
         return
     end
 
+    RUNTIME.visitor_event_latched = true
     RUNTIME.last_visitor_event_ms = now_ms()
     update_property(PROPERTY_LAST_VISITOR_EVENT, now_string())
     set_variable(VARIABLE_LAST_VISITOR_EVENT, now_string())
@@ -803,8 +912,20 @@ local function evaluate_events_response(decoded, reason)
 
     if active and (previous ~= true or is_push_refresh(reason)) then
         fire_visitor_pressed(reason)
+        if is_push_refresh(reason) then
+            RUNTIME.refresh_burst_cancelled = true
+        end
     elseif not active and previous == true then
+        RUNTIME.visitor_event_latched = false
+        if is_push_refresh(reason) then
+            RUNTIME.refresh_burst_cancelled = true
+        end
         dbg("Visitor state reset to false from source " .. tostring(reason))
+    elseif not active then
+        RUNTIME.visitor_event_latched = false
+        if is_push_refresh(reason) then
+            RUNTIME.refresh_burst_cancelled = true
+        end
     end
 end
 
@@ -955,7 +1076,7 @@ function REOLINK.CloseConnection()
     if RUNTIME.connected then
         dbg("Closing Baichuan TCP connection")
     end
-    C4:NetDisconnect(DEFAULT_NETBINDING, RUNTIME.config.baichuan_port)
+    C4:NetDisconnect(BAICHUAN_NETBINDING, RUNTIME.config.baichuan_port)
     mark_connection_status("OFFLINE")
 end
 
@@ -974,9 +1095,9 @@ function REOLINK.OpenConnection()
     -- Baichuan push on port 9000 is a raw TCP transport. The HTTPS property is
     -- reserved for the local Reolink API refresh work that will be added next.
     dbg("Creating standard TCP network binding to " .. RUNTIME.config.host)
-    C4:CreateNetworkConnection(DEFAULT_NETBINDING, RUNTIME.config.host)
+    C4:CreateNetworkConnection(BAICHUAN_NETBINDING, RUNTIME.config.host)
 
-    OCS[DEFAULT_NETBINDING] = function(idBinding, nPort, strStatus)
+    OCS[BAICHUAN_NETBINDING] = function(idBinding, nPort, strStatus)
         dbg("Connection status changed: binding=" .. tostring(idBinding) .. " port=" .. tostring(nPort) .. " status=" .. tostring(strStatus))
         if nPort == RUNTIME.config.baichuan_port then
             mark_connection_status(strStatus)
@@ -991,8 +1112,8 @@ function REOLINK.OpenConnection()
         end
     end
 
-    RFN[DEFAULT_NETBINDING] = function(idBinding, nPort, strData)
-        if idBinding ~= DEFAULT_NETBINDING or nPort ~= RUNTIME.config.baichuan_port then
+    RFN[BAICHUAN_NETBINDING] = function(idBinding, nPort, strData)
+        if idBinding ~= BAICHUAN_NETBINDING or nPort ~= RUNTIME.config.baichuan_port then
             return
         end
 
@@ -1006,7 +1127,7 @@ function REOLINK.OpenConnection()
 
     update_property(PROPERTY_CONNECTION_STATUS, "Connecting")
     dbg("Opening Baichuan TCP connection to " .. RUNTIME.config.baichuan_port)
-    C4:NetConnect(DEFAULT_NETBINDING, RUNTIME.config.baichuan_port, "TCP")
+    C4:NetConnect(BAICHUAN_NETBINDING, RUNTIME.config.baichuan_port, "TCP")
 end
 
 function REOLINK.ReconnectNow()
